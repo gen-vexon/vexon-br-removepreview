@@ -1,115 +1,240 @@
 <!doctype html>
 <html lang="ja">
-<head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<meta name="referrer" content="no-referrer">
-<title>PDFプレビュー文字削除ツール</title>
-<style>
-:root { font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans JP", sans-serif; color: #182235; background:#f5f7fb; }
-* {box-sizing:border-box} body{margin:0} main{max-width:740px;margin:56px auto;padding:0 20px} h1{font-size:1.75rem;margin:0 0 10px} .intro{color:#53637a;line-height:1.7;margin-bottom:24px}
-.panel{background:#fff;border:1px solid #e1e6ef;border-radius:16px;padding:26px;box-shadow:0 8px 30px #1a2a4a0a}
-.drop{display:block;border:2px dashed #a8b8d0;border-radius:12px;padding:32px 18px;text-align:center;cursor:pointer;background:#fafcff}
-.drop.drag{border-color:#2563eb;background:#eaf1ff}.drop strong{display:block;font-size:1.07rem}.drop span{display:block;font-size:.87rem;color:#65728a;margin-top:8px}
-input[type=file]{position:absolute;opacity:0;width:1px;height:1px} button{margin-top:16px;background:#245cdc;color:white;border:0;border-radius:9px;padding:12px 22px;font-size:1rem;font-weight:600;cursor:pointer}button:disabled{opacity:.5;cursor:not-allowed}
-#fileNames{margin:16px 0 0;overflow-wrap:anywhere;color:#42536e;font-size:.92rem}#results{margin-top:22px} .result{padding:12px 0;border-top:1px solid #e8edf4;line-height:1.65}.result a{color:#1558c9;font-weight:600}.ok{color:#147348}.err{color:#b42318}.note{color:#66758e;font-size:.87rem;line-height:1.8;margin-top:20px}
-</style>
-</head>
-<body>
-<main><h1>PDFプレビュー文字削除ツール</h1>
-<p class="intro">対応する請求書PDFに重なっている「プレビュー」の透かしだけを取り除きます。PDFはブラウザ内で処理され、サーバーへ送信されません。</p>
-<section class="panel">
-<label class="drop" id="drop" for="files"><strong>PDFを選択、またはここにドロップ</strong><span>複数ファイルも選択できます</span></label>
-<input id="files" type="file" accept="application/pdf,.pdf" multiple>
-<div id="fileNames" aria-live="polite">ファイルが選択されていません</div>
-<button id="run" type="button" disabled>プレビュー文字を削除</button>
-<div id="results" aria-live="polite"></div>
-</section>
-<p class="note">対応対象：専用の <code>/Fx1 Do</code> 描画命令によって透かしが挿入されたPDF。異なる構造のPDFは安全のため処理せず、エラーを表示します。元のPDFは変更しません。公開サイトに機密PDFやサンプル請求書を置かないでください。</p>
-</main>
-<script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
-<script>
-'use strict';
-const fileInput = document.querySelector('#files');
-const button = document.querySelector('#run');
-const results = document.querySelector('#results');
-const names = document.querySelector('#fileNames');
-const drop = document.querySelector('#drop');
-let selectedFiles = [];
-function selectFiles(files) {
-  selectedFiles = Array.from(files).filter(file => file.name.toLowerCase().endsWith('.pdf'));
-  button.disabled = selectedFiles.length === 0;
-  names.textContent = selectedFiles.length ? `${selectedFiles.length}件：${selectedFiles.map(f => f.name).join('、')}` : 'PDFが選択されていません';
-  results.replaceChildren();
-}
-fileInput.addEventListener('change', () => selectFiles(fileInput.files));
-for(const type of ['dragenter','dragover']) drop.addEventListener(type,e=>{e.preventDefault();drop.classList.add('drag')});
-for(const type of ['dragleave','drop']) drop.addEventListener(type,e=>{e.preventDefault();drop.classList.remove('drag')});
-drop.addEventListener('drop', e => selectFiles(e.dataTransfer.files));
 
-async function decodeStream(stream, PDFLib) {
-  if (!(stream instanceof PDFLib.PDFRawStream)) throw Error('対応していないPDFストリームです');
-  const bytes = stream.getContents();
-  const filter = stream.dict.get(PDFLib.PDFName.of('Filter'));
-  if (!filter) return new TextDecoder('latin1').decode(bytes);
-  if (filter.toString() !== '/FlateDecode') throw Error('非対応の圧縮形式です');
-  if (!('DecompressionStream' in window)) throw Error('このブラウザはPDFの展開機能に対応していません');
-  const ds = new DecompressionStream('deflate');
-  const writer = ds.writable.getWriter();
-  // Avoid waiting for write completion before a reader is consuming the stream.
-  const reading = new Response(ds.readable).arrayBuffer();
-  await writer.write(bytes);
-  await writer.close();
-  return new TextDecoder('latin1').decode(await reading);
-}
-async function removePreview(bytes) {
-  const lib = window.PDFLib;
-  if(!lib) throw Error('PDF編集ライブラリを読み込めません。ネット接続を確認してください');
-  const pdf = await lib.PDFDocument.load(bytes, { updateMetadata: false });
-  let pagesChanged = 0;
-  for (const page of pdf.getPages()) {
-    const contentsRef = page.node.get(lib.PDFName.of('Contents'));
-    const contents = pdf.context.lookup(contentsRef);
-    if (!(contents instanceof lib.PDFArray)) continue;
-    const resources = page.node.Resources();
-    const xobjects = resources && resources.lookup(lib.PDFName.of('XObject'));
-    if (!(xobjects instanceof lib.PDFDict) || !xobjects.has(lib.PDFName.of('Fx1'))) continue;
-    const fx = pdf.context.lookup(xobjects.get(lib.PDFName.of('Fx1')));
-    if (!(fx instanceof lib.PDFRawStream) || fx.dict.get(lib.PDFName.of('Subtype'))?.toString() !== '/Form') continue;
-    let changed = false;
-    for(let i = 0; i < contents.size(); i++) {
-      const stream = pdf.context.lookup(contents.get(i));
-      const decoded = await decodeStream(stream, lib);
-      // This strictly matches the separate preview overlay stream from the supplied PDF.
-      // Retain its leading Q to close the graphics-state q in the earlier stream.
-      if (/^\s*Q\s+q\s+1(?:\.0+)?\s+0\s+0\s+1(?:\.0+)?\s+0\s+0\s+cm\s+\/Fx1\s+Do\s+Q\s*$/.test(decoded)) {
-        const replacement = pdf.context.register(pdf.context.flateStream('Q\n'));
-        contents.set(i, replacement);
-        changed = true;
-      }
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>PDFプレビュー削除</title>
+  <style>
+    :root {
+      font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans JP", sans-serif;
+      color: #182235;
+      background: #f5f7fb;
     }
-    if (changed) pagesChanged++;
-  }
-  if (!pagesChanged) throw Error('対応するプレビュー透かしが見つかりませんでした。元PDFは変更していません');
-  const output = await pdf.save({ useObjectStreams: false });
-  return { output, pagesChanged };
-}
-function addResult(file, message, success, url, downloadName) {
-  const wrap = document.createElement('div'); wrap.className='result';
-  const status = document.createElement('div'); status.className=success?'ok':'err'; status.textContent=`${file.name}: ${message}`;wrap.append(status);
-  if(url){const a=document.createElement('a');a.href=url;a.download=downloadName;a.textContent='処理済みPDFをダウンロード';wrap.append(a)}
-  results.append(wrap);
-}
-button.addEventListener('click',async()=>{
-  button.disabled=true;results.replaceChildren();
-  for(const file of selectedFiles){
-    try{
-      const {output,pagesChanged}=await removePreview(await file.arrayBuffer());
-      const url=URL.createObjectURL(new Blob([output],{type:'application/pdf'}));
-      const downloadName=file.name.replace(/\.pdf$/i,'')+'_preview_removed.pdf';
-      addResult(file,`${pagesChanged}ページの透かしを除去しました`,true,url,downloadName);
-    }catch(error){console.error(error);addResult(file,error?.message||'処理に失敗しました',false)}
-  }
-  button.disabled=selectedFiles.length===0;
-});
-</script>
-</body></html>
+
+    * {
+      box-sizing: border-box
+    }
+
+    body {
+      margin: 0
+    }
+
+    main {
+      max-width: 740px;
+      margin: 56px auto;
+      padding: 0 20px
+    }
+
+    h1 {
+      font-size: 1.75rem;
+      margin: 0 0 10px
+    }
+
+    .intro {
+      color: #53637a;
+      line-height: 1.7;
+      margin-bottom: 24px
+    }
+
+    .panel {
+      background: #fff;
+      border: 1px solid #e1e6ef;
+      border-radius: 16px;
+      padding: 26px;
+      box-shadow: 0 8px 30px #1a2a4a0a
+    }
+
+    .drop {
+      display: block;
+      border: 2px dashed #a8b8d0;
+      border-radius: 12px;
+      padding: 32px 18px;
+      text-align: center;
+      cursor: pointer;
+      background: #fafcff
+    }
+
+    .drop.drag {
+      border-color: #2563eb;
+      background: #eaf1ff
+    }
+
+    .drop strong {
+      display: block;
+      font-size: 1.07rem
+    }
+
+    .drop span {
+      display: block;
+      font-size: .87rem;
+      color: #65728a;
+      margin-top: 8px
+    }
+
+    input[type=file] {
+      position: absolute;
+      opacity: 0;
+      width: 1px;
+      height: 1px
+    }
+
+    button {
+      margin-top: 16px;
+      background: #245cdc;
+      color: white;
+      border: 0;
+      border-radius: 9px;
+      padding: 12px 22px;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer
+    }
+
+    button:disabled {
+      opacity: .5;
+      cursor: not-allowed
+    }
+
+    #fileNames {
+      margin: 16px 0 0;
+      overflow-wrap: anywhere;
+      color: #42536e;
+      font-size: .92rem
+    }
+
+    #results {
+      margin-top: 22px
+    }
+
+    .result {
+      padding: 12px 0;
+      border-top: 1px solid #e8edf4;
+      line-height: 1.65
+    }
+
+    .result a {
+      color: #1558c9;
+      font-weight: 600
+    }
+
+    .ok {
+      color: #147348
+    }
+
+    .err {
+      color: #b42318
+    }
+
+    .note {
+      color: #66758e;
+      font-size: .87rem;
+      line-height: 1.8;
+      margin-top: 20px
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>PDFプレビュー削除</h1>
+    <p class="intro">対応する請求書PDFに重なっている「プレビュー」の透かしを取り除きます。</p>
+    <section class="panel">
+      <label class="drop" id="drop" for="files"><strong>PDFを選択、またはここにドロップ</strong></label>
+      <input id="files" type="file" accept="application/pdf,.pdf" multiple>
+      <div id="fileNames" aria-live="polite">ファイルが選択されていません</div>
+      <button id="run" type="button" disabled>プレビュー文字を削除</button>
+      <div id="results" aria-live="polite"></div>
+    </section>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/pdf-lib@1.17.1/dist/pdf-lib.min.js" crossorigin="anonymous"
+    referrerpolicy="no-referrer"></script>
+  <script>
+    'use strict';
+    const fileInput = document.querySelector('#files');
+    const button = document.querySelector('#run');
+    const results = document.querySelector('#results');
+    const names = document.querySelector('#fileNames');
+    const drop = document.querySelector('#drop');
+    let selectedFiles = [];
+    function selectFiles(files) {
+      selectedFiles = Array.from(files).filter(file => file.name.toLowerCase().endsWith('.pdf'));
+      button.disabled = selectedFiles.length === 0;
+      names.textContent = selectedFiles.length ? `${selectedFiles.length}件：${selectedFiles.map(f => f.name).join('、')}` : 'PDFが選択されていません';
+      results.replaceChildren();
+    }
+    fileInput.addEventListener('change', () => selectFiles(fileInput.files));
+    for (const type of ['dragenter', 'dragover']) drop.addEventListener(type, e => { e.preventDefault(); drop.classList.add('drag') });
+    for (const type of ['dragleave', 'drop']) drop.addEventListener(type, e => { e.preventDefault(); drop.classList.remove('drag') });
+    drop.addEventListener('drop', e => selectFiles(e.dataTransfer.files));
+
+    async function decodeStream(stream, PDFLib) {
+      if (!(stream instanceof PDFLib.PDFRawStream)) throw Error('対応していないPDFストリームです');
+      const bytes = stream.getContents();
+      const filter = stream.dict.get(PDFLib.PDFName.of('Filter'));
+      if (!filter) return new TextDecoder('latin1').decode(bytes);
+      if (filter.toString() !== '/FlateDecode') throw Error('非対応の圧縮形式です');
+      if (!('DecompressionStream' in window)) throw Error('このブラウザはPDFの展開機能に対応していません');
+      const ds = new DecompressionStream('deflate');
+      const writer = ds.writable.getWriter();
+      // Avoid waiting for write completion before a reader is consuming the stream.
+      const reading = new Response(ds.readable).arrayBuffer();
+      await writer.write(bytes);
+      await writer.close();
+      return new TextDecoder('latin1').decode(await reading);
+    }
+    async function removePreview(bytes) {
+      const lib = window.PDFLib;
+      if (!lib) throw Error('PDF編集ライブラリを読み込めません。ネット接続を確認してください');
+      const pdf = await lib.PDFDocument.load(bytes, { updateMetadata: false });
+      let pagesChanged = 0;
+      for (const page of pdf.getPages()) {
+        const contentsRef = page.node.get(lib.PDFName.of('Contents'));
+        const contents = pdf.context.lookup(contentsRef);
+        if (!(contents instanceof lib.PDFArray)) continue;
+        const resources = page.node.Resources();
+        const xobjects = resources && resources.lookup(lib.PDFName.of('XObject'));
+        if (!(xobjects instanceof lib.PDFDict) || !xobjects.has(lib.PDFName.of('Fx1'))) continue;
+        const fx = pdf.context.lookup(xobjects.get(lib.PDFName.of('Fx1')));
+        if (!(fx instanceof lib.PDFRawStream) || fx.dict.get(lib.PDFName.of('Subtype'))?.toString() !== '/Form') continue;
+        let changed = false;
+        for (let i = 0; i < contents.size(); i++) {
+          const stream = pdf.context.lookup(contents.get(i));
+          const decoded = await decodeStream(stream, lib);
+          // This strictly matches the separate preview overlay stream from the supplied PDF.
+          // Retain its leading Q to close the graphics-state q in the earlier stream.
+          if (/^\s*Q\s+q\s+1(?:\.0+)?\s+0\s+0\s+1(?:\.0+)?\s+0\s+0\s+cm\s+\/Fx1\s+Do\s+Q\s*$/.test(decoded)) {
+            const replacement = pdf.context.register(pdf.context.flateStream('Q\n'));
+            contents.set(i, replacement);
+            changed = true;
+          }
+        }
+        if (changed) pagesChanged++;
+      }
+      if (!pagesChanged) throw Error('対応するプレビュー透かしが見つかりませんでした。元PDFは変更していません');
+      const output = await pdf.save({ useObjectStreams: false });
+      return { output, pagesChanged };
+    }
+    function addResult(file, message, success, url, downloadName) {
+      const wrap = document.createElement('div'); wrap.className = 'result';
+      const status = document.createElement('div'); status.className = success ? 'ok' : 'err'; status.textContent = `${file.name}: ${message}`; wrap.append(status);
+      if (url) { const a = document.createElement('a'); a.href = url; a.download = downloadName; a.textContent = '処理済みPDFをダウンロード'; wrap.append(a) }
+      results.append(wrap);
+    }
+    button.addEventListener('click', async () => {
+      button.disabled = true; results.replaceChildren();
+      for (const file of selectedFiles) {
+        try {
+          const { output, pagesChanged } = await removePreview(await file.arrayBuffer());
+          const url = URL.createObjectURL(new Blob([output], { type: 'application/pdf' }));
+          const downloadName = file.name.replace(/\.pdf$/i, '') + '_preview_removed.pdf';
+          addResult(file, `${pagesChanged}ページの透かしを除去しました`, true, url, downloadName);
+        } catch (error) { console.error(error); addResult(file, error?.message || '処理に失敗しました', false) }
+      }
+      button.disabled = selectedFiles.length === 0;
+    });
+  </script>
+</body>
+
+</html>
