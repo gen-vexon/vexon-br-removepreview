@@ -98,10 +98,22 @@
     }
 
     #fileNames {
-      margin: 16px 0 0;
+      margin: 18px 0 0;
+      padding: 16px 20px;
+      background: #eff6ff;
+      border: 2px solid #93c5fd;
+      border-radius: 10px;
+      color: #1d4ed8;
+      font-size: 1.1rem;
+      font-weight: 700;
       overflow-wrap: anywhere;
-      color: #42536e;
-      font-size: .92rem
+    }
+
+    #fileNames:not(.selected) {
+      background: #f8fafc;
+      border-color: #e2e8f0;
+      color: #64748b;
+      font-weight: 400;
     }
 
     #results {
@@ -161,6 +173,7 @@
     function selectFiles(files) {
       selectedFiles = Array.from(files).filter(file => file.name.toLowerCase().endsWith('.pdf'));
       button.disabled = selectedFiles.length === 0;
+      names.classList.toggle('selected', selectedFiles.length > 0);
       names.textContent = selectedFiles.length ? `${selectedFiles.length}件：${selectedFiles.map(f => f.name).join('、')}` : 'PDFが選択されていません';
       results.replaceChildren();
     }
